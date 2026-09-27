@@ -2,6 +2,22 @@ import { spawn } from 'node:child_process';
 import { Plugin } from '@opencode/plugin/tui';
 import { StatusTracker, type WindowStatus } from './status';
 
+function hasLocalPane(): boolean {
+  // Match workmux's backend selection, but require an identifiable local pane.
+  const panes: Record<string, boolean> = {
+    tmux: !!process.env.TMUX && !!process.env.TMUX_PANE,
+    wezterm: !!process.env.WEZTERM_PANE,
+    zellij: !!process.env.ZELLIJ_PANE_ID,
+    kitty: !!process.env.KITTY_WINDOW_ID,
+  };
+  const override = process.env.WORKMUX_BACKEND;
+  if (override) return panes[override] ?? false;
+  if (process.env.TMUX !== undefined) return panes.tmux;
+  if (process.env.WEZTERM_PANE) return panes.wezterm;
+  if (process.env.ZELLIJ || process.env.ZELLIJ_PANE_ID || process.env.ZELLIJ_SESSION_NAME) return panes.zellij;
+  return panes.kitty;
+}
+
 function workmux(...args: string[]): Promise<boolean> {
   return new Promise((resolve) => {
     // Workmux reads stdin for hook metadata. An open pipe makes it wait forever.
@@ -21,8 +37,8 @@ function workmux(...args: string[]): Promise<boolean> {
 export default Plugin.define({
   id: 'workmux.status',
   setup(ctx) {
-    // The shared server has no reliable relationship to this tmux pane.
-    if (!process.env.TMUX || !process.env.TMUX_PANE) return;
+    // The shared server has no reliable relationship to this terminal pane.
+    if (!hasLocalPane()) return;
 
     let closed = false;
     let desired: WindowStatus | undefined;

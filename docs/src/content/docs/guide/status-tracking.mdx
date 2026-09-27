@@ -118,7 +118,7 @@ Restart omp for the extension to take effect.
 
 Use `workmux setup` to install the plugin matching your installed OpenCode version. V1 and V2 use different plugin APIs; installing the V1 file in OpenCode V2 will not work. Setup removes the other version's workmux plugin when switching versions while preserving unrelated plugins.
 
-The V2 plugin runs in each terminal pane, so it can continue reporting activity for sessions even after their tabs close. It requires tmux and does not register an agent outside a tmux pane.
+The V2 plugin runs in each terminal pane, so it can continue reporting activity for sessions even after their tabs close. It supports tmux, WezTerm, Zellij, and Kitty, and does not register an agent outside a supported multiplexer pane.
 
 For manual **OpenCode V1** setup, download the original plugin:
 
