@@ -75,6 +75,11 @@ export class StatusTracker {
     if (this.sessions.delete(sessionID)) this.update();
   }
 
+  isActive(sessionID: string): boolean {
+    const status = this.sessions.get(sessionID)?.status;
+    return status === 'working' || status === 'waiting';
+  }
+
   private update() {
     const statuses = [...this.sessions.values()].map((session) => session.status);
     const status: WindowStatus = statuses.includes('waiting')
