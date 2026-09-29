@@ -118,7 +118,11 @@ Restart omp for the extension to take effect.
 
 Use `workmux setup` to install the plugin matching your installed OpenCode version. V1 and V2 use different plugin APIs; installing the V1 file in OpenCode V2 will not work. Setup removes the other version's workmux plugin when switching versions while preserving unrelated plugins.
 
-The V2 plugin runs in each terminal pane, so it can continue reporting activity for sessions even after their tabs close. It supports tmux, WezTerm, Zellij, and Kitty, and does not register an agent outside a supported multiplexer pane.
+Setup recognizes older bundled plugins and records installed-file fingerprints in `.workmux-status.json` inside the OpenCode configuration directory for future version switches. If a conflicting plugin has local edits, setup leaves it in place and reports an error; save those edits and remove the conflicting workmux files before retrying.
+
+The V2 plugin runs in the full-screen terminal UI. It tracks session families viewed in that pane and continues reporting their current background work after navigation away or tab closure. Ownership expires when that work finishes, so later executions elsewhere do not update the old pane. It supports tmux, WezTerm, Zellij, and Kitty, and does not register an agent outside a supported multiplexer pane.
+
+Headless `opencode run` is not tracked by the V2 plugin. OpenCode's shared server does not provide the originating client's pane identity to this integration, and headless runs do not load its TUI entrypoint. Full V1/V2 parity for headless runs requires a separate client-side integration; the server plugin must not infer a pane from the shared server's environment.
 
 For manual **OpenCode V1** setup, download the original plugin:
 

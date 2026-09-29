@@ -37,6 +37,51 @@ async function waitForCalls(count: number) {
   expect(await calls()).toHaveLength(count);
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function hydrationHarness(options: {
+  family?: string[];
+  root?: (id: string) => string;
+  sync?: (id: string) => Promise<void>;
+  permissionSync?: () => Promise<void>;
+  pending?: string[];
+  pendingSession?: string;
+  forms?: string[];
+} = {}) {
+  process.env.TMUX = 'test-tmux';
+  process.env.TMUX_PANE = '%123';
+  let handler: (input: any) => void = () => {};
+  let open = true;
+  const cleanup = await plugin.setup({
+    data: {
+      listen: (callback: typeof handler) => { handler = callback; return () => {}; },
+      session: {
+        root: options.root ?? (() => 'ours'),
+        family: () => options.family ?? ['ours'],
+        get: () => undefined,
+        status: () => 'running',
+        sync: options.sync ?? (async () => {}),
+        permission: {
+          sync: options.permissionSync ?? (async () => {}),
+          list: (sessionID: string) => options.pendingSession && options.pendingSession !== sessionID
+            ? [] : (options.pending ?? []).map((id) => ({ id })),
+        },
+        form: { sync: async () => {}, list: () => (options.forms ?? []).map((id) => ({ id })) },
+      },
+    },
+    ui: { router: { current: () => open ? { type: 'session', sessionID: 'ours' } : { type: 'home' } } },
+  } as any);
+  return {
+    close: () => { open = false; },
+    cleanup: async () => { if (typeof cleanup === 'function') await cleanup(); },
+    emit: (type: string, data: object) => handler({ details: { type, data } }),
+  };
+}
+
 afterEach(async () => {
   for (const name of muxVariables) {
     const original = originalMux[name];
@@ -47,6 +92,157 @@ afterEach(async () => {
   if (originalLog === undefined) delete process.env.WORKMUX_TEST_LOG;
   else process.env.WORKMUX_TEST_LOG = originalLog;
   await rm(testDir, { recursive: true });
+});
+
+test('hydration reconciles pending requests after a busy event', async () => {
+  const permissions = deferred();
+  const harness = await hydrationHarness({
+    permissionSync: () => permissions.promise,
+    pending: ['allow-edit'],
+  });
+  try {
+    await waitForCalls(1);
+    harness.emit('session.status', { sessionID: 'ours', status: { type: 'busy' } });
+    await waitForCalls(2);
+    permissions.resolve();
+    await waitForCalls(3);
+    expect(await calls()).toEqual([
+      '%123|register-agent',
+      '%123|set-window-status working',
+      '%123|set-window-status waiting',
+    ]);
+  } finally {
+    permissions.resolve();
+    await harness.cleanup();
+  }
+});
+
+test.each(['permission.replied', 'form.replied', 'form.cancelled'])('hydration does not restore a request after %s', async (type) => {
+  const permissions = deferred();
+  const harness = await hydrationHarness({
+    permissionSync: () => permissions.promise,
+    pending: type === 'permission.replied' ? ['request'] : [],
+    forms: type !== 'permission.replied' ? ['request'] : [],
+  });
+  try {
+    await waitForCalls(1);
+    harness.emit('session.status', { sessionID: 'ours', status: { type: 'busy' } });
+    await waitForCalls(2);
+    harness.emit(type, { sessionID: 'ours', requestID: 'request', id: 'request' });
+    permissions.resolve();
+    await Bun.sleep(50);
+    expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working']);
+  } finally {
+    permissions.resolve();
+    await harness.cleanup();
+  }
+});
+
+test('hydration never reports done while a running child is still loading', async () => {
+  const child = deferred();
+  const harness = await hydrationHarness({
+    family: ['ours', 'child'],
+    sync: async (id) => { if (id === 'child') await child.promise; },
+  });
+  try {
+    await waitForCalls(2);
+    harness.close();
+    harness.emit('session.execution.succeeded', { sessionID: 'ours' });
+    await Bun.sleep(50);
+    expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working']);
+    child.resolve();
+    await Bun.sleep(50);
+    expect(await calls()).toHaveLength(2);
+    harness.emit('session.execution.succeeded', { sessionID: 'child' });
+    await waitForCalls(3);
+    expect((await calls()).at(-1)).toBe('%123|set-window-status done');
+    harness.emit('session.execution.started', { sessionID: 'child' });
+    await Bun.sleep(50);
+    expect(await calls()).toHaveLength(3);
+  } finally {
+    child.resolve();
+    await harness.cleanup();
+  }
+});
+
+test.each(['permission.replied', 'session.execution.succeeded', 'session.deleted'])('hydration captures child %s before its parent metadata loads', async (type) => {
+  const child = deferred();
+  const harness = await hydrationHarness({
+    family: ['ours', 'child'],
+    root: (id) => id, // The family is known, but the child's root/parent metadata is not.
+    sync: async (id) => { if (id === 'child') await child.promise; },
+    pending: ['request'],
+    pendingSession: 'child',
+  });
+  try {
+    await waitForCalls(2);
+    harness.emit('session.execution.succeeded', { sessionID: 'ours' });
+    harness.emit(type, { sessionID: 'child', requestID: 'request' });
+    child.resolve();
+    await Bun.sleep(50);
+    if (type === 'permission.replied') {
+      expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working']);
+      harness.emit('session.execution.succeeded', { sessionID: 'child' });
+    }
+    await waitForCalls(3);
+    expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working', '%123|set-window-status done']);
+  } finally {
+    child.resolve();
+    await harness.cleanup();
+  }
+});
+
+test('hydration retries a failed child sync after the tab closes without premature completion', async () => {
+  const firstAttempt = deferred();
+  const retry = deferred();
+  let attempts = 0;
+  const harness = await hydrationHarness({
+    family: ['ours', 'child'],
+    sync: async (id) => {
+      if (id !== 'child') return;
+      if (++attempts === 1) {
+        await firstAttempt.promise;
+        throw new Error('temporary sync failure');
+      }
+      retry.resolve();
+    },
+  });
+  try {
+    await waitForCalls(2);
+    harness.close();
+    harness.emit('session.execution.succeeded', { sessionID: 'ours' });
+    firstAttempt.resolve();
+    await Bun.sleep(50);
+    expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working']);
+    await Promise.race([retry.promise, Bun.sleep(1200)]);
+    expect(attempts).toBe(2);
+    await Bun.sleep(50);
+    expect(await calls()).toHaveLength(2);
+    harness.emit('session.execution.succeeded', { sessionID: 'child' });
+    await waitForCalls(3);
+    expect((await calls()).at(-1)).toBe('%123|set-window-status done');
+  } finally {
+    firstAttempt.resolve();
+    await harness.cleanup();
+  }
+});
+
+test.each(['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted', 'session.deleted'])('hydration cannot restore a session after %s', async (type) => {
+  const permissions = deferred();
+  const harness = await hydrationHarness({ permissionSync: () => permissions.promise, pending: ['request'] });
+  try {
+    await waitForCalls(1);
+    harness.emit('session.status', { sessionID: 'ours', status: { type: 'busy' } });
+    await waitForCalls(2);
+    harness.emit(type, { sessionID: 'ours' });
+    permissions.resolve();
+    await waitForCalls(3);
+    await Bun.sleep(50);
+    expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working', '%123|set-window-status done']);
+  } finally {
+    permissions.resolve();
+    await harness.cleanup();
+  }
 });
 
 test('releases closed tabs after background work finishes', async () => {

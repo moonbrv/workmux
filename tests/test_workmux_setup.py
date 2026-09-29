@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from .conftest import (
     MuxEnvironment,
     run_workmux_command,
@@ -12,7 +14,6 @@ from .support.setup import (
     run_setup_with_answers,
     write_claude_manual_status_hook,
 )
-
 
 # ---------------------------------------------------------------------------
 # Non-interactive tests (no prompt expected)
@@ -278,28 +279,21 @@ class TestSetupInstall:
         install_opencode_version(mux_server, "v1.18.29")
         plugin_dir = mux_server.home_path / ".config" / "opencode" / "plugins"
         plugin_dir.mkdir(parents=True)
-        bundled_plugin = (
+        historical_plugin = (
             Path(__file__).parent.parent
-            / "resources"
+            / "tests"
+            / "fixtures"
             / "opencode"
-            / "plugins"
-            / "workmux-status.ts"
+            / "v1-0b0c3875.ts"
         ).read_text()
-        registration = """  try {
-    await $`workmux register-agent`.quiet();
-  } catch {
-    // Status tracking remains available when registration cannot reach workmux.
-  }
+        (plugin_dir / "workmux-status.ts").write_text(historical_plugin)
 
-"""
-        (plugin_dir / "workmux-status.ts").write_text(
-            bundled_plugin.replace(registration, "")
-        )
-
+        # This historical version produces a long diff; its trailing added
+        # handler remains visible when the confirmation prompt is displayed.
         run_setup_with_answers(
             mux_server,
             workmux_exe_path,
-            expected_output=("workmux register-agent",),
+            expected_output=("case 'session.deleted':",),
         )
 
         assert (
@@ -378,24 +372,27 @@ class TestSetupInstall:
         plugin_text = plugin_path.read_text()
         assert "workmux register-agent" in plugin_text
 
+    @pytest.mark.parametrize(
+        "v1_source",
+        [
+            "resources/opencode/plugins/workmux-status.ts",
+            "tests/fixtures/opencode/v1-0b0c3875.ts",
+        ],
+        ids=["current-v1", "historical-v1"],
+    )
     def test_opencode_v2_install_replaces_v1_entrypoint(
         self,
         mux_server: MuxEnvironment,
         workmux_exe_path: Path,
         repo_path: Path,
+        v1_source: str,
     ):
         """V2 setup removes only the conflicting workmux V1 entrypoint."""
         install_opencode_version(mux_server, "v2.0.18")
         opencode_dir = mux_server.home_path / ".config" / "opencode"
         plugins = opencode_dir / "plugins"
         plugins.mkdir(parents=True)
-        bundled_v1 = (
-            Path(__file__).parent.parent
-            / "resources"
-            / "opencode"
-            / "plugins"
-            / "workmux-status.ts"
-        )
+        bundled_v1 = Path(__file__).parent.parent / v1_source
         (plugins / "workmux-status.ts").write_text(bundled_v1.read_text())
         (plugins / "custom.ts").write_text("// keep me")
 
