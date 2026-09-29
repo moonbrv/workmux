@@ -56,7 +56,12 @@ export default Plugin.define({
 
     // Server events and the tabs list are shared between clients. Only this
     // TUI's current route establishes ownership of a session family.
-    type Lease = { members: Set<string>; hydrating: boolean; hydrated: boolean };
+    type Lease = {
+      members: Set<string>;
+      hydrating: boolean;
+      hydrated: boolean;
+      hydration: ReturnType<StatusTracker['beginHydration']>;
+    };
     const roots = new Map<string, Lease>();
     const owned = new Map<string, string>();
     const parents = new Map<string, string>();
@@ -81,8 +86,10 @@ export default Plugin.define({
     function releaseIfIdle(root: string) {
       const lease = roots.get(root);
       if (!lease || visibleRoot === root || lease.hydrating) return;
+      if (!lease.hydrated && !deleted.has(root)) return;
       if ([...lease.members].some((sessionID) => tracker.isActive(sessionID))) return;
       roots.delete(root);
+      lease.hydration.finish();
       for (const sessionID of lease.members) {
         if (owned.get(sessionID) === root) owned.delete(sessionID);
         tracker.forget(sessionID);
@@ -91,37 +98,44 @@ export default Plugin.define({
     }
 
     async function hydrate(root: string, lease: Lease) {
+      lease.hydrating = true;
       let hydrated = false;
       try {
         // The family cache may be empty until the root's metadata is loaded.
         await ctx.data.session.sync(root);
         if (closed || roots.get(root) !== lease || deleted.has(root)) return;
         const family = new Set([root, ...ctx.data.session.family(root)]);
+        // Claim the complete known family before any child awaits. Its events
+        // may arrive before the child's own root/parent metadata is cached.
+        for (const sessionID of family) {
+          if (deleted.has(sessionID)) continue;
+          owned.set(sessionID, root);
+          lease.members.add(sessionID);
+        }
         for (const sessionID of family) {
           if (closed || roots.get(root) !== lease) return;
+          if (deleted.has(sessionID)) continue;
           if (sessionID !== root) await ctx.data.session.sync(sessionID);
           await Promise.all([
             ctx.data.session.permission.sync(sessionID),
             ctx.data.session.form.sync(sessionID),
           ]);
           if (closed || roots.get(root) !== lease || deleted.has(root) || deleted.has(sessionID)) continue;
-          // Membership comes from the synced root's family, even if the
-          // child's individual root/parent cache has not populated yet.
-          owned.set(sessionID, root);
-          lease.members.add(sessionID);
           const pending = [
             ...(ctx.data.session.permission.list(sessionID) ?? []).map((request) => `permission:${request.id}`),
             ...(ctx.data.session.form.list(sessionID) ?? []).map((form) => `form:${form.id}`),
           ];
           if (ctx.data.session.status(sessionID) === 'running' || pending.length) {
-            tracker.seed(sessionID, pending);
+            lease.hydration.seed(sessionID, pending);
           }
         }
         hydrated = true;
       } catch (error) {
-        // The route reconciliation retries while the session remains visible.
+        // Keep the completion barrier until reconciliation can load the family,
+        // even if its tab closed while a background child was being discovered.
         console.warn('[workmux.status] could not hydrate session status', error);
       } finally {
+        if (hydrated || closed || deleted.has(root)) lease.hydration.finish();
         if (roots.get(root) !== lease) return;
         lease.hydrating = false;
         lease.hydrated = hydrated;
@@ -135,13 +149,12 @@ export default Plugin.define({
       if (deleted.has(root)) return;
       let lease = roots.get(root);
       if (!lease) {
-        lease = { members: new Set(), hydrating: false, hydrated: false };
+        lease = { members: new Set(), hydrating: false, hydrated: false, hydration: tracker.beginHydration() };
         roots.set(root, lease);
       }
       owned.set(sessionID, root);
       lease.members.add(sessionID);
       if (!lease.hydrating && !lease.hydrated) {
-        lease.hydrating = true;
         void hydrate(root, lease);
       }
     }
@@ -152,7 +165,10 @@ export default Plugin.define({
       const root = sessionID && !deleted.has(sessionID) ? ctx.data.session.root(sessionID) : undefined;
       visibleRoot = root && !deleted.has(root) ? root : undefined;
       if (sessionID && visibleRoot) claim(sessionID);
-      for (const ownedRoot of roots.keys()) releaseIfIdle(ownedRoot);
+      for (const [ownedRoot, lease] of roots) {
+        if (!lease.hydrating && !lease.hydrated && !deleted.has(ownedRoot)) void hydrate(ownedRoot, lease);
+        releaseIfIdle(ownedRoot);
+      }
     }
 
     const stop = ctx.data.listen(({ details: event }) => {
@@ -210,6 +226,7 @@ export default Plugin.define({
           if (owner) roots.get(owner)?.members.delete(sessionID);
           if (visibleRoot === sessionID) visibleRoot = undefined;
           deleted.add(sessionID);
+          roots.get(sessionID)?.hydration.finish();
           break;
       }
       if (owner) releaseIfIdle(owner);
@@ -223,6 +240,7 @@ export default Plugin.define({
       closed = true;
       clearInterval(timer);
       stop();
+      for (const lease of roots.values()) lease.hydration.finish();
     };
   },
 });
