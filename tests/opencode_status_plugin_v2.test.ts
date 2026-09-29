@@ -49,7 +49,7 @@ afterEach(async () => {
   await rm(testDir, { recursive: true });
 });
 
-test('tracks this pane and its children even after closing its tab, but not another pane', async () => {
+test('releases closed tabs after background work finishes', async () => {
   process.env.TMUX = 'test-tmux';
   process.env.TMUX_PANE = '%123';
   let handler: (input: any) => void = () => {};
@@ -107,22 +107,169 @@ test('tracks this pane and its children even after closing its tab, but not anot
     '%123|set-window-status done',
   ]);
 
+  // Closing the tab must not make a later, unrelated turn belong to this pane.
+  emit('session.execution.started', { sessionID: 'ours' });
+  await Bun.sleep(50);
+  expect(await calls()).toHaveLength(5);
+  emit('permission.asked', { sessionID: 'ours', id: 'allow-edit' });
+  emit('permission.replied', { sessionID: 'ours', requestID: 'allow-edit' });
+  emit('session.execution.failed', { sessionID: 'ours' });
+  await Bun.sleep(50);
+  expect(await calls()).toHaveLength(5);
+  // Navigating back to the session explicitly acquires it again.
+  tabOpen = true;
   emit('session.execution.started', { sessionID: 'ours' });
   await waitForCalls(6);
-  emit('permission.asked', { sessionID: 'ours', id: 'allow-edit' });
-  await waitForCalls(7);
-  emit('permission.replied', { sessionID: 'ours', requestID: 'allow-edit' });
-  await waitForCalls(8);
-  emit('session.execution.failed', { sessionID: 'ours' });
-  await waitForCalls(9);
-  expect((await calls()).slice(5)).toEqual([
-    '%123|set-window-status working',
-    '%123|set-window-status waiting',
+  expect((await calls()).at(-1)).toBe('%123|set-window-status working');
+  if (typeof cleanup === 'function') await cleanup();
+  expect(stopped).toBe(true);
+});
+
+test('shared tabs do not claim another pane', async () => {
+  process.env.TMUX = 'test-tmux';
+  const handlers: Array<(input: any) => void> = [];
+  // The tabs and server events are shared, but each TUI has its own route.
+  const tabs = [{ sessionID: 'ours' }, { sessionID: 'other' }];
+  function client(sessionID: string) {
+    return {
+      data: {
+        listen(callback: (input: any) => void) { handlers.push(callback); return () => {}; },
+        session: {
+          root: (id: string) => id,
+          family: (id: string) => [id],
+          get: () => undefined,
+          status: () => 'idle',
+          sync: async () => {},
+          permission: { sync: async () => {}, list: () => [] },
+          form: { sync: async () => {}, list: () => [] },
+        },
+      },
+      ui: { router: { current: () => ({ type: 'session', sessionID }) }, tabs: { list: () => tabs } },
+    };
+  }
+
+  process.env.TMUX_PANE = '%123';
+  const cleanupA = await plugin.setup(client('ours') as any);
+  process.env.TMUX_PANE = '%456';
+  const cleanupB = await plugin.setup(client('other') as any);
+  await waitForCalls(2);
+  process.env.TMUX_PANE = '%123';
+  handlers[0]({ details: { type: 'session.execution.started', data: { sessionID: 'ours' } } });
+  await waitForCalls(3);
+  process.env.TMUX_PANE = '%456';
+  handlers[1]({ details: { type: 'session.execution.started', data: { sessionID: 'ours' } } });
+  await Bun.sleep(50);
+  process.env.TMUX_PANE = '%123';
+  handlers[0]({ details: { type: 'session.execution.succeeded', data: { sessionID: 'ours' } } });
+  await waitForCalls(4);
+  process.env.TMUX_PANE = '%456';
+  handlers[1]({ details: { type: 'session.execution.succeeded', data: { sessionID: 'ours' } } });
+  await Bun.sleep(50); // allow any wrongly claimed pane to flush its queued status write
+  expect((await calls()).filter((call) => call.includes('set-window-status'))).toEqual([
     '%123|set-window-status working',
     '%123|set-window-status done',
   ]);
+  // Switch the test process's pane marker before dispatching to each client;
+  // separate TUI processes have separate environments in production.
+  if (typeof cleanupA === 'function') await cleanupA();
+  if (typeof cleanupB === 'function') await cleanupB();
+});
+
+test('hydrates after root sync so a running family member is found', async () => {
+  process.env.TMUX = 'test-tmux';
+  process.env.TMUX_PANE = '%123';
+  let rootSynced = false;
+  const ctx = {
+    data: {
+      listen: () => () => {},
+      session: {
+        root: (id: string) => id,
+        family: () => rootSynced ? ['ours', 'child'] : ['ours'],
+        get: () => undefined, // the child's metadata is not in this cache yet
+        status: (id: string) => id === 'child' ? 'running' : 'idle',
+        sync: async (id: string) => { if (id === 'ours') rootSynced = true; },
+        permission: { sync: async () => {}, list: () => [] },
+        form: { sync: async () => {}, list: () => [] },
+      },
+    },
+    ui: { router: { current: () => ({ type: 'session', sessionID: 'ours' }) }, tabs: { list: () => [] } },
+  };
+  const cleanup = await plugin.setup(ctx as any);
+  await waitForCalls(2);
+  expect(await calls()).toEqual(['%123|register-agent', '%123|set-window-status working']);
   if (typeof cleanup === 'function') await cleanup();
-  expect(stopped).toBe(true);
+});
+
+test('late hydration does not reclaim a deleted root', async () => {
+  process.env.TMUX = 'test-tmux';
+  process.env.TMUX_PANE = '%123';
+  let resume!: () => void;
+  const sync = new Promise<void>((resolve) => { resume = resolve; });
+  let handler: (input: any) => void = () => {};
+  const ctx = {
+    data: {
+      listen: (callback: typeof handler) => { handler = callback; return () => {}; },
+      session: {
+        root: (id: string) => id,
+        family: () => ['ours'],
+        get: () => undefined,
+        status: () => 'running',
+        sync: () => sync,
+        permission: { sync: async () => {}, list: () => [] },
+        form: { sync: async () => {}, list: () => [] },
+      },
+    },
+    ui: { router: { current: () => ({ type: 'session', sessionID: 'ours' }) }, tabs: { list: () => [] } },
+  };
+  const cleanup = await plugin.setup(ctx as any);
+  await waitForCalls(1);
+  handler({ details: { type: 'session.deleted', data: { sessionID: 'ours' } } });
+  resume();
+  await Bun.sleep(50);
+  handler({ details: { type: 'session.execution.started', data: { sessionID: 'ours' } } });
+  await Bun.sleep(50);
+  expect(await calls()).toEqual(['%123|register-agent']);
+  if (typeof cleanup === 'function') await cleanup();
+});
+
+test('closing a tab during hydration keeps discovered background work until completion', async () => {
+  process.env.TMUX = 'test-tmux';
+  process.env.TMUX_PANE = '%123';
+  let resume!: () => void;
+  const rootSync = new Promise<void>((resolve) => { resume = resolve; });
+  let loaded = false;
+  let tabOpen = true;
+  let handler: (input: any) => void = () => {};
+  const ctx = {
+    data: {
+      listen: (callback: typeof handler) => { handler = callback; return () => {}; },
+      session: {
+        root: (id: string) => id === 'child' ? 'ours' : id,
+        family: () => loaded ? ['ours', 'child'] : ['ours'],
+        get: (id: string) => id === 'child' ? { parentID: 'ours' } : undefined,
+        status: (id: string) => id === 'child' ? 'running' : 'idle',
+        sync: async (id: string) => {
+          if (id === 'ours') { await rootSync; loaded = true; }
+        },
+        permission: { sync: async () => {}, list: () => [] },
+        form: { sync: async () => {}, list: () => [] },
+      },
+    },
+    ui: { router: { current: () => tabOpen ? { type: 'session', sessionID: 'ours' } : { type: 'home' } }, tabs: { list: () => [] } },
+  };
+  const cleanup = await plugin.setup(ctx as any);
+  await waitForCalls(1);
+  tabOpen = false;
+  handler({ details: { type: 'session.created', data: { sessionID: 'unrelated' } } });
+  resume();
+  await waitForCalls(2);
+  expect((await calls()).at(-1)).toBe('%123|set-window-status working');
+  handler({ details: { type: 'session.execution.succeeded', data: { sessionID: 'child' } } });
+  await waitForCalls(3);
+  handler({ details: { type: 'session.execution.started', data: { sessionID: 'child' } } });
+  await Bun.sleep(50);
+  expect(await calls()).toHaveLength(3);
+  if (typeof cleanup === 'function') await cleanup();
 });
 
 test.each([

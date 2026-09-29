@@ -55,3 +55,14 @@ test('seeding an already running session includes its pending requests', () => {
   status.forget('parent');
   expect(reports).toEqual(['waiting', 'working', 'done']);
 });
+
+test('active state follows execution and permission lifetimes', () => {
+  const { status } = tracker();
+  expect(status.isActive('parent')).toBe(false);
+  status.start('parent');
+  expect(status.isActive('parent')).toBe(true);
+  status.wait('parent', 'permission:1');
+  expect(status.isActive('parent')).toBe(true);
+  status.finish('parent');
+  expect(status.isActive('parent')).toBe(false);
+});
